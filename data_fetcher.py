@@ -153,7 +153,11 @@ class DataFetcher:
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows, columns=['日期', '开盘', '收盘', '最高', '最低', '成交量'])
+        normalized_rows = [row[:6] for row in rows if len(row) >= 6]
+        if not normalized_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(normalized_rows, columns=['日期', '开盘', '收盘', '最高', '最低', '成交量'])
         for col in ('开盘', '收盘', '最高', '最低'):
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
