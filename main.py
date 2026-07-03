@@ -215,6 +215,51 @@ class TradingAssistantPlugin(Star):
             logger.warning(f"分析因数据不完整而终止: {ticker}")
         
         return report
+
+    async def _send_file_via_onebot_upload(
+        self,
+        event: AstrMessageEvent,
+        file_path: str,
+        file_name: str,
+    ) -> bool:
+        """使用 OneBot 上传接口发送文件，避免 File 消息段在 NapCat 中显示 0 B。"""
+        bot = getattr(event, "bot", None)
+        if bot is None or not hasattr(bot, "call_action"):
+            logger.warning(
+                "OneBot 文件上传入口不可用，将回退到 File 组件发送: "
+                f"event_type={type(event).__name__}, platform={event.get_platform_name()}, "
+                f"has_bot={bot is not None}, has_call_action={hasattr(bot, 'call_action') if bot is not None else False}"
+            )
+            return False
+
+        group_id = event.get_group_id()
+        sender_id = event.get_sender_id()
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        logger.info(
+            f"OneBot 文件上传入口已就绪: event_type={type(event).__name__}, "
+            f"group_id={group_id}, sender_id={sender_id}, file={file_path}, size={file_size}"
+        )
+        try:
+            if group_id:
+                logger.info(f"使用 OneBot upload_group_file 发送报告: group_id={group_id}, file={file_path}")
+                await bot.call_action(
+                    "upload_group_file",
+                    group_id=int(group_id),
+                    file=file_path,
+                    name=file_name,
+                )
+            else:
+                logger.info(f"使用 OneBot upload_private_file 发送报告: user_id={sender_id}, file={file_path}")
+                await bot.call_action(
+                    "upload_private_file",
+                    user_id=int(sender_id),
+                    file=file_path,
+                    name=file_name,
+                )
+            return True
+        except Exception as e:
+            logger.error(f"OneBot 文件上传失败，将回退到 File 组件发送: {type(e).__name__}: {repr(e)}", exc_info=True)
+            return False
     
     async def _do_stock_analysis(self, ticker_input: str, event: AstrMessageEvent,
                                     quick_mode: bool = False) -> MessageEventResult:
@@ -267,15 +312,48 @@ class TradingAssistantPlugin(Star):
                         file_path = save_report_pdf(report, ticker)
                         file_label = "PDF"
                     except Exception as pdf_err:
-                        logger.error(f"PDF 生成失败: {type(pdf_err).__name__}: {repr(pdf_err)}")
-                        file_path = save_report_md(report, ticker)
-                        file_label = "Markdown"
+                        logger.warning(f"PDF 首次生成失败，尝试重新生成: {type(pdf_err).__name__}: {repr(pdf_err)}")
+                        try:
+                            file_path = save_report_pdf(report, ticker)
+                            file_label = "PDF"
+                        except Exception as retry_err:
+                            logger.error(f"PDF 重新生成仍失败: {type(retry_err).__name__}: {repr(retry_err)}")
+                            yield event.plain_result("PDF 报告生成失败，已停止发送长报告。请查看 AstrBot 日志定位 weasyprint 或文件写入问题。")
+                            return
                 else:
-                    file_path = save_report_md(report, ticker)
-                    file_label = "Markdown"
+                    yield event.plain_result("当前环境 PDF 组件不可用，已停止发送长报告。请启用 PDF 或 TXT 导出。")
+                    return
+
+                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                logger.info(f"报告附件准备发送: {file_path}, size={file_size}, label={file_label}")
+                if file_label == "PDF" and file_size <= 0:
+                    logger.warning(f"PDF 附件大小异常，重新生成后再发送: {file_path}")
+                    try:
+                        file_path = save_report_pdf(report, ticker)
+                        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                        logger.info(f"PDF 附件重新生成完成: {file_path}, size={file_size}")
+                    except Exception as retry_err:
+                        logger.error(f"PDF 附件重新生成失败: {type(retry_err).__name__}: {repr(retry_err)}")
+                        yield event.plain_result("PDF 报告文件大小异常，重新生成失败，已停止发送长报告。")
+                        return
+                    if file_size <= 0:
+                        logger.error(f"PDF 附件重新生成后仍为空: {file_path}")
+                        yield event.plain_result("PDF 报告文件重新生成后仍为空，已停止发送长报告。")
+                        return
+
+                plain_text = f"📊 {ticker} 分析结论：\n\n{conclusion}\n\n---\n📄 完整报告见附件（{file_label}）。"
+                if file_label == "PDF":
+                    sent_by_upload = await self._send_file_via_onebot_upload(
+                        event,
+                        file_path,
+                        os.path.basename(file_path),
+                    )
+                    if sent_by_upload:
+                        yield event.plain_result(plain_text)
+                        return
 
                 chain = [
-                    Comp.Plain(f"📊 {ticker} 分析结论：\n\n{conclusion}\n\n---\n📄 完整报告见附件（{file_label}）。"),
+                    Comp.Plain(plain_text),
                     Comp.File(file=file_path, name=os.path.basename(file_path)),
                 ]
                 yield event.chain_result(chain)

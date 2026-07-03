@@ -415,9 +415,15 @@ def save_report_pdf(md_text: str, ticker: str, output_dir: str | None = None) ->
     filepath = os.path.join(output_dir, filename)
 
     pdf_bytes = markdown_to_pdf_bytes(md_text)
+    if not pdf_bytes:
+        raise RuntimeError("PDF 生成结果为空")
 
     with open(filepath, "wb") as f:
         f.write(pdf_bytes)
+
+    file_size = os.path.getsize(filepath)
+    if file_size <= 0:
+        raise RuntimeError(f"PDF 文件写入后为空: {filepath}")
 
     return filepath
 

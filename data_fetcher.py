@@ -547,8 +547,81 @@ class DataFetcher:
             return f"获取港股数据失败: {str(e)}"
     
 
+    def _format_us_sina_market_data(self, ticker: str, trade_date: str, market_info: Dict, hist_df) -> str:
+        """格式化 akshare 新浪财经美股日线数据。"""
+        import pandas as pd
+
+        if hist_df is None or hist_df.empty:
+            return "新浪财经美股日线数据为空"
+
+        df = hist_df.copy()
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df = df.dropna(subset=['date']).sort_values('date')
+        else:
+            df = df.sort_index()
+
+        if df.empty:
+            return "新浪财经美股日线数据为空"
+
+        latest = df.iloc[-1]
+
+        def _fmt_money(value):
+            try:
+                return f"${float(value):.2f}"
+            except Exception:
+                return str(value) if value is not None else "N/A"
+
+        def _fmt_number(value):
+            try:
+                return f"{float(value):,.0f}"
+            except Exception:
+                return str(value) if value is not None else "N/A"
+
+        def _row_date(row):
+            if 'date' in row.index:
+                value = row.get('date')
+                if hasattr(value, 'strftime'):
+                    return value.strftime('%Y-%m-%d')
+                return str(value)
+            idx = row.name
+            return idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
+
+        latest_date = _row_date(latest)
+        latest_close = latest.get('close', 'N/A')
+
+        hist_text = "### 最近5个交易日\n"
+        close_pct = df['close'].pct_change() * 100 if 'close' in df.columns else None
+        for idx, row in df.tail(5).iterrows():
+            pct = close_pct.loc[idx] if close_pct is not None and idx in close_pct.index else 0
+            pct = 0 if pct != pct else pct
+            pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
+            hist_text += f"- **{_row_date(row)}**: 收{_fmt_money(row.get('close', 'N/A'))} ({pct_str}%)\n"
+
+        return f"""## 美股市场数据
+
+**股票代码**: {ticker}
+**交易日期**: {trade_date}
+**市场**: {market_info['market_name']}
+**货币**: {market_info['currency_name']}（{market_info['currency_symbol']}）
+
+### 日线行情（akshare 新浪财经）
+| 指标 | 数值 |
+|------|------|
+| 最新交易日 | {latest_date} |
+| 开盘 | {_fmt_money(latest.get('open', 'N/A'))} |
+| 最高 | {_fmt_money(latest.get('high', 'N/A'))} |
+| 最低 | {_fmt_money(latest.get('low', 'N/A'))} |
+| 收盘 | {_fmt_money(latest_close)} |
+| 成交量 | {_fmt_number(latest.get('volume', 'N/A'))} |
+
+{hist_text}
+---
+*数据来源: akshare（新浪财经 stock_us_daily）*
+"""
+
     async def _get_us_market_data(self, ticker: str, trade_date: str, market_info: Dict) -> str:
-        """获取美股市场数据（akshare主数据源 + yfinance备选）"""
+        """获取美股市场数据（akshare主数据源 + 新浪日线兜底 + yfinance备选）"""
         
         # === 1. 尝试 akshare 作为主数据源 ===
         if self.akshare_available:
@@ -566,18 +639,25 @@ class DataFetcher:
                     if not matched.empty:
                         row = matched.iloc[0]
                         ak_code = row['代码']  # 完整的 akshare 代码
+
+                        def _row_first(*names):
+                            for name in names:
+                                value = row.get(name, None)
+                                if value is not None:
+                                    return value
+                            return 'N/A'
                         
                         realtime_text = f"""### 实时行情（akshare）
 | 指标 | 数值 |
 |------|------|
 | 股票名称 | {row.get('名称', 'N/A')} |
-| 最新价 | ${row.get('最新价', row.get('现价', 'N/A'))} |
+| 最新价 | ${_row_first('最新价', '现价')} |
 | 涨跌额 | {row.get('涨跌额', 'N/A')} |
 | 涨跌幅 | {row.get('涨跌幅', 'N/A')}% |
-| 今开 | {row.get('今开', 'N/A')} |
-| 最高 | {row.get('最高', 'N/A')} |
-| 最低 | {row.get('最低', 'N/A')} |
-| 昨收 | {row.get('昨收', 'N/A')} |
+| 今开 | {_row_first('今开', '开盘价')} |
+| 最高 | {_row_first('最高', '最高价')} |
+| 最低 | {_row_first('最低', '最低价')} |
+| 昨收 | {_row_first('昨收', '昨收价')} |
 | 成交量 | {row.get('成交量', 'N/A')} |
 | 成交额 | {row.get('成交额', 'N/A')} |
 | 总市值 | {row.get('总市值', 'N/A')} |
@@ -624,7 +704,20 @@ class DataFetcher:
 *数据来源: akshare（东方财富）*
 """
             except Exception as e:
-                logger.warning(f"akshare获取美股数据失败，回退到yfinance: {e}")
+                logger.warning(f"akshare东方财富获取美股数据失败，尝试新浪财经日线接口: {e}")
+
+            try:
+                import akshare as ak
+
+                hist_df = await self._run_akshare(
+                    ak.stock_us_daily,
+                    symbol=ticker,
+                    adjust="qfq",
+                    timeout=30,
+                )
+                return self._format_us_sina_market_data(ticker, trade_date, market_info, hist_df)
+            except Exception as e:
+                logger.warning(f"akshare新浪获取美股日线失败，回退到yfinance: {e}")
         
         # === 2. 回退到 yfinance ===
         if not self.yfinance_available:
@@ -1918,7 +2011,7 @@ class DataFetcher:
 
         # 通用失败关键词（对所有长度都检测）
         failure_keywords = [
-            '获取失败', '未安装', '无法获取', '不可用',
+            '获取失败', '未安装', '无法获取',
             'akshare和yfinance均不可用',
             '需要付费数据源',
             '数据失败',     # 匹配 "获取市场数据失败"、"获取基本面数据失败" 等
@@ -1929,6 +2022,13 @@ class DataFetcher:
 
         for kw in failure_keywords:
             if kw in data_stripped:
+                return {'valid': False, 'reason': data_first_line}
+
+        first_line_failure_keywords = [
+            '不可用',
+        ]
+        for kw in first_line_failure_keywords:
+            if kw in data_first_line:
                 return {'valid': False, 'reason': data_first_line}
 
         # 长文本失败模式检测：Markdown 格式的错误页面
