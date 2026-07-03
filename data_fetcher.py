@@ -29,6 +29,64 @@ class DataFetcher:
     async def _run_akshare(self, func, *args, timeout: int = 30, **kwargs):
         """在线程池中执行 akshare 调用（不修改全局 requests.get）。"""
         return await self._run_blocking(func, *args, timeout=timeout, **kwargs)
+
+    def _format_technical_indicators(self, hist_df, currency_symbol: str) -> str:
+        """格式化通用技术指标；失败时不影响主行情返回。"""
+        try:
+            from .utils.technical_indicators import format_technical_indicators
+
+            return "\n" + format_technical_indicators(hist_df, currency_symbol) + "\n"
+        except Exception as e:
+            logger.warning(f"技术指标计算失败: {e}")
+            return "\n### 技术指标\n计算失败，无法提供真实技术指标\n"
+
+    def _make_yfinance_ticker(self, yf, ticker: str, use_requests_session: bool = False):
+        """创建 yfinance Ticker；默认保留 yfinance 自带传输层，仅在指定时用 requests 兜底。"""
+        if not use_requests_session:
+            return yf.Ticker(ticker)
+
+        try:
+            import requests
+
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            return yf.Ticker(ticker, session=session)
+        except Exception as e:
+            logger.warning(f"创建 yfinance requests Session 失败，使用默认 Ticker: {e}")
+            return yf.Ticker(ticker)
+
+    def _is_yfinance_transport_error(self, error: Exception) -> bool:
+        """识别 yfinance/curl_cffi 在本机环境里的 TLS 传输初始化异常。"""
+        message = str(error)
+        transport_markers = (
+            "curl: (35)",
+            "TLS connect error",
+            "OPENSSL_internal",
+            "invalid library",
+        )
+        return any(marker in message for marker in transport_markers)
+
+    async def _get_yfinance_info(self, yf, ticker: str, timeout: int = 30) -> tuple:
+        """获取 yfinance info；默认使用 curl_cffi，遇到本机 TLS 异常才 requests 重试。"""
+        stock = self._make_yfinance_ticker(yf, ticker)
+        try:
+            return stock, await self._run_blocking(lambda: stock.info, timeout=timeout)
+        except Exception as e:
+            if not self._is_yfinance_transport_error(e):
+                raise
+
+            logger.warning(
+                f"yfinance默认传输层获取 {ticker} 失败，使用 requests Session 重试: {e}"
+            )
+            stock = self._make_yfinance_ticker(yf, ticker, use_requests_session=True)
+            return stock, await self._run_blocking(lambda: stock.info, timeout=timeout)
     
     def _initialize_akshare(self):
         """
@@ -73,7 +131,7 @@ class DataFetcher:
             return 'sh'
         return 'sz'
 
-    def _tencent_kline(self, code: str, days: int = 60) -> "pd.DataFrame":
+    def _tencent_kline(self, code: str, days: int = 90) -> "pd.DataFrame":
         """通过腾讯接口获取 A 股前复权日 K 线，返回 DataFrame。
         
         列: 日期, 开盘, 收盘, 最高, 最低, 成交量
@@ -243,7 +301,7 @@ class DataFetcher:
             code = StockUtils.strip_market_prefix(ticker)
             
             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-            start_date = end_date - timedelta(days=30)
+            start_date = end_date - timedelta(days=90)
             
             # 重试机制 - 最多尝试3次（akshare / 东方财富）
             df = None
@@ -280,7 +338,7 @@ class DataFetcher:
             if df is None or df.empty:
                 logger.info(f"东方财富接口不可用，尝试腾讯接口获取A股数据: {code}")
                 try:
-                    df = await self._run_blocking(self._tencent_kline, code, 30)
+                    df = await self._run_blocking(self._tencent_kline, code, 90)
                     if df is not None and not df.empty:
                         use_tencent = True
                         # 添加「涨跌幅」列（腾讯 K 线不含此列）
@@ -345,6 +403,8 @@ class DataFetcher:
                 _pct = row['涨跌幅']
                 _pct_str = f"{_pct:+.2f}" if isinstance(_pct, (int, float)) else str(_pct)
                 result += f"- **{row['日期']}**: 收{row['收盘']} ({_pct_str}%)\n"
+
+            result += self._format_technical_indicators(df, market_info['currency_symbol'])
             
             # 获取实时行情
             if use_tencent:
@@ -489,7 +549,7 @@ class DataFetcher:
             hist_text = ""
             try:
                 end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-                start_date = end_date - timedelta(days=60)  # 多取一些确保有足够交易日
+                start_date = end_date - timedelta(days=90)  # 覆盖 MA60 等常用技术指标
                 
                 hist_df = await self._run_akshare(
                     ak.stock_hk_hist,
@@ -519,6 +579,7 @@ class DataFetcher:
 |------|------|------|------|------|--------|--------|--------|
 | {latest.get('日期', 'N/A')} | {latest.get('开盘', 'N/A')} | {latest.get('收盘', 'N/A')} | {latest.get('最高', 'N/A')} | {latest.get('最低', 'N/A')} | {latest.get('成交量', 'N/A')} | {latest.get('成交额', 'N/A')} | {latest.get('涨跌幅', 'N/A')}% |
 """
+                    hist_text += self._format_technical_indicators(hist_df, market_info['currency_symbol'])
                 else:
                     hist_text = "### 历史K线\n暂无历史K线数据\n"
             except Exception as e:
@@ -558,8 +619,14 @@ class DataFetcher:
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df = df.dropna(subset=['date']).sort_values('date')
+            end_date = pd.to_datetime(trade_date, errors='coerce')
+            if pd.notna(end_date):
+                df = df[df['date'] <= end_date]
         else:
             df = df.sort_index()
+            end_date = pd.to_datetime(trade_date, errors='coerce')
+            if pd.notna(end_date):
+                df = df[df.index <= end_date]
 
         if df.empty:
             return "新浪财经美股日线数据为空"
@@ -597,6 +664,7 @@ class DataFetcher:
             pct = 0 if pct != pct else pct
             pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
             hist_text += f"- **{_row_date(row)}**: 收{_fmt_money(row.get('close', 'N/A'))} ({pct_str}%)\n"
+        technical_text = self._format_technical_indicators(df, market_info['currency_symbol'])
 
         return f"""## 美股市场数据
 
@@ -616,6 +684,7 @@ class DataFetcher:
 | 成交量 | {_fmt_number(latest.get('volume', 'N/A'))} |
 
 {hist_text}
+{technical_text}
 ---
 *数据来源: akshare（新浪财经 stock_us_daily）*
 """
@@ -667,7 +736,7 @@ class DataFetcher:
                         hist_text = ""
                         try:
                             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-                            start_date = end_date - timedelta(days=60)
+                            start_date = end_date - timedelta(days=90)
                             
                             hist_df = await self._run_akshare(
                                 ak.stock_us_hist,
@@ -687,6 +756,7 @@ class DataFetcher:
                                     pct = hrow.get('涨跌幅', 'N/A')
                                     _pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
                                     hist_text += f"- **{date_str}**: 收${close} ({_pct_str}%)\n"
+                                hist_text += self._format_technical_indicators(hist_df, market_info['currency_symbol'])
                         except Exception as e:
                             logger.warning(f"获取美股历史K线失败(akshare): {e}")
                             hist_text = "\n### 历史K线\n获取失败\n"
@@ -726,12 +796,11 @@ class DataFetcher:
         try:
             import yfinance as yf
             
-            stock = yf.Ticker(ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
             
             # 获取历史数据
             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-            start_date = end_date - timedelta(days=30)
+            start_date = end_date - timedelta(days=90)
             hist = await self._run_blocking(stock.history, start=start_date, end=end_date, timeout=30)
             
             hist_text = ""
@@ -746,6 +815,7 @@ class DataFetcher:
                     pct = 0 if (pct != pct) else pct  # NaN guard
                     _pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
                     hist_text += f"- **{date_str}**: 收${close:.2f} ({_pct_str}%)\n"
+                hist_text += self._format_technical_indicators(hist, market_info['currency_symbol'])
             
             return f"""## 美股市场数据
 
@@ -955,8 +1025,7 @@ class DataFetcher:
                 import yfinance as yf
                 
                 yf_ticker = f"{code}.HK"
-                stock = yf.Ticker(yf_ticker)
-                info = await self._run_blocking(lambda: stock.info, timeout=30)
+                stock, info = await self._get_yfinance_info(yf, yf_ticker, timeout=30)
                 
                 if info:
                     # 估值指标
@@ -1066,8 +1135,7 @@ class DataFetcher:
             try:
                 import yfinance as yf
                 
-                stock = yf.Ticker(ticker)
-                info = await self._run_blocking(lambda: stock.info, timeout=30)
+                stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
                 if not isinstance(info, dict):
                     info = {}
 
@@ -1221,6 +1289,51 @@ class DataFetcher:
             return "akshare未安装"
         except Exception as e:
             return f"获取A股新闻失败: {str(e)}"
+
+    def _format_yfinance_news_item(self, item: Dict) -> str:
+        """格式化 yfinance 新闻条目，兼容新旧返回结构。"""
+        content = item.get('content') if isinstance(item.get('content'), dict) else item
+        title = content.get('title') or item.get('title')
+        if not title or title == 'N/A':
+            return ""
+
+        provider = content.get('provider') if isinstance(content.get('provider'), dict) else {}
+        publisher = (
+            content.get('publisher')
+            or item.get('publisher')
+            or provider.get('displayName')
+            or provider.get('sourceId')
+            or 'N/A'
+        )
+
+        pub_ts = (
+            content.get('providerPublishTime')
+            or item.get('providerPublishTime')
+            or content.get('pubDate')
+            or item.get('pubDate')
+            or content.get('displayTime')
+            or ''
+        )
+        if isinstance(pub_ts, (int, float)) and pub_ts:
+            try:
+                from datetime import timezone
+                pub_date = datetime.fromtimestamp(int(pub_ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                pub_date = str(pub_ts)
+        else:
+            pub_date = str(pub_ts) if pub_ts else 'N/A'
+
+        url = ''
+        for key in ('clickThroughUrl', 'canonicalUrl'):
+            value = content.get(key)
+            if isinstance(value, dict) and value.get('url'):
+                url = value.get('url')
+                break
+        if not url:
+            url = content.get('link') or item.get('link') or ''
+
+        suffix = f" - {url}" if url else ""
+        return f"- **{publisher}** ({pub_date}): {title}{suffix}\n"
     
     async def _get_hk_news(self, ticker: str, trade_date: str, market_info: Dict) -> str:
         """获取港股新闻（yfinance）"""
@@ -1245,20 +1358,10 @@ class DataFetcher:
 ### 近期新闻
 """
                 for item in news[:10]:
-                    title = item.get('title', 'N/A')
-                    publisher = item.get('publisher', 'N/A')
-                    # yfinance 新闻时间戳处理
-                    pub_ts = item.get('providerPublishTime', item.get('pubDate', ''))
-                    if isinstance(pub_ts, (int, float)) and pub_ts:
-                        try:
-                            from datetime import timezone
-                            pub_date = datetime.fromtimestamp(int(pub_ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
-                        except Exception:
-                            pub_date = str(pub_ts)
-                    else:
-                        pub_date = str(pub_ts)
-                    news_text += f"- **{publisher}** ({pub_date}): {title}\n"
+                    news_text += self._format_yfinance_news_item(item)
                 
+                if "): " not in news_text:
+                    return f"暂无港股{code}.HK的有效新闻数据"
                 news_text += "\n---\n*数据来源: yfinance*\n"
                 return news_text
             else:
@@ -1283,11 +1386,10 @@ class DataFetcher:
                 news_text = f"## 美股新闻数据\n\n**股票代码**: {ticker}\n**日期**: {trade_date}\n\n### 近期新闻\n"
                 
                 for item in news[:10]:
-                    pub_date = item.get('pubDate', 'N/A')
-                    title = item.get('title', 'N/A')
-                    publisher = item.get('publisher', 'N/A')
-                    news_text += f"- **{publisher}** ({pub_date}): {title}\n"
+                    news_text += self._format_yfinance_news_item(item)
                 
+                if "): " not in news_text:
+                    return f"暂无{ticker}的有效新闻数据"
                 return news_text
             else:
                 return f"暂无{ticker}的新闻数据"
@@ -1378,8 +1480,7 @@ class DataFetcher:
             import yfinance as yf
             
             yf_ticker = f"{code}.HK"
-            stock = yf.Ticker(yf_ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, yf_ticker, timeout=30)
             
             sentiment_parts = [f"""## 港股情绪数据
 
@@ -1439,8 +1540,7 @@ class DataFetcher:
         try:
             import yfinance as yf
             
-            stock = yf.Ticker(ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
             
             # 从分析评级获取情绪
             recommendations = await self._run_blocking(
