@@ -830,6 +830,7 @@ class DataFetcher:
 
 """
                 
+                valid_indicator_count = 0
                 if main_indicators is not None and not main_indicators.empty:
                     # 找到最新一期数据的列
                     cols = main_indicators.columns.tolist()
@@ -865,6 +866,7 @@ class DataFetcher:
                             if not row.empty:
                                 val = row[latest_col].values[0]
                                 if pd.notna(val):
+                                    valid_indicator_count += 1
                                     if isinstance(val, (int, float)):
                                         if abs(val) > 1e8:  # 亿
                                             result += f"| {display_name} | {val/1e8:.2f}亿 |\n"
@@ -878,7 +880,10 @@ class DataFetcher:
                                     result += f"| {display_name} | N/A |\n"
                             else:
                                 result += f"| {display_name} | N/A |\n"
-                
+
+                if valid_indicator_count == 0:
+                    return "无法获取A股基本面数据: 财务指标为空"
+                 
                 return result
                 
             except Exception as e:
@@ -1063,6 +1068,39 @@ class DataFetcher:
                 
                 stock = yf.Ticker(ticker)
                 info = await self._run_blocking(lambda: stock.info, timeout=30)
+                if not isinstance(info, dict):
+                    info = {}
+
+                quote_type = str(info.get('quoteType') or '').upper()
+                legal_type = str(info.get('legalType') or '').lower()
+                is_fund = quote_type in ('ETF', 'MUTUALFUND') or 'fund' in legal_type
+                if is_fund:
+                    result_parts.append(f"""### 基金基本信息（yfinance）
+| 指标 | 数值 |
+|------|------|
+| 基金名称 | {info.get('longName') or info.get('shortName') or 'N/A'} |
+| 基金类型 | {info.get('quoteType', 'N/A')} |
+| 基金分类 | {info.get('category', 'N/A')} |
+| 基金公司 | {info.get('fundFamily', 'N/A')} |
+| 法律类型 | {info.get('legalType', 'N/A')} |
+| 基金规模/总资产 | ${format(info.get('totalAssets'), ',.0f') if info.get('totalAssets') else 'N/A'} |
+| 净值 | ${info.get('navPrice', 'N/A')} |
+| 市盈率(TTM) | {info.get('trailingPE', 'N/A')} |
+| 费用率 | {f"{info.get('expenseRatio')*100:.2f}%" if info.get('expenseRatio') else 'N/A'} |
+| 收益率 | {f"{info.get('yield')*100:.2f}%" if info.get('yield') else 'N/A'} |
+""")
+                    result_parts.append("\n*数据来源: yfinance + akshare（雪球）*\n")
+                    return "\n".join(result_parts)
+
+                key_fields = [
+                    'trailingPE', 'forwardPE', 'priceToBook',
+                    'priceToSalesTrailing12Months', 'marketCap',
+                    'trailingEps', 'totalRevenue', 'profitMargins',
+                ]
+                valid_key_count = sum(
+                    1 for field in key_fields
+                    if info.get(field) not in (None, '', 'N/A')
+                )
                 
                 # 获取财务报表
                 financial_text = ""
@@ -1088,6 +1126,9 @@ class DataFetcher:
                 except Exception as e:
                     logger.warning(f"获取美股财务报表失败: {e}")
                 
+                if valid_key_count == 0 and not financial_text:
+                    return "无法获取美股基本面数据: yfinance未返回有效财务指标"
+
                 result_parts.append(f"""### 估值指标（yfinance）
 | 指标 | 数值 |
 |------|------|
@@ -2039,6 +2080,33 @@ class DataFetcher:
         for pattern in long_failure_patterns:
             if re.search(pattern, data_stripped):
                 return {'valid': False, 'reason': data_first_line}
+
+        if source_name == '基本面数据':
+            metric_keywords = [
+                '市盈率', '市净率', '市销率', 'ROE', '净资产收益率',
+                '每股收益', 'EPS', '净利润', '收入', '营业总收入',
+                '毛利率', '净利率', '市值', '企业价值', '资产负债率',
+                '经营现金流', '流动比率', '速动比率',
+                '基金规模', '总资产', '净值', '费用率', '收益率',
+                '基金类型', '基金分类', '基金公司',
+            ]
+            invalid_values = ('N/A', '暂无', '未知', '无法获取', '获取失败', '未安装')
+            valid_metric_count = 0
+            for line in data_stripped.splitlines():
+                line_stripped = line.strip()
+                if not line_stripped.startswith('|') or line_stripped.startswith('|------'):
+                    continue
+                if not any(keyword in line_stripped for keyword in metric_keywords):
+                    continue
+                cells = [cell.strip() for cell in line_stripped.strip('|').split('|')]
+                if len(cells) < 2:
+                    continue
+                value = cells[-1]
+                if value and not any(marker in value for marker in invalid_values):
+                    valid_metric_count += 1
+
+            if valid_metric_count < 2:
+                return {'valid': False, 'reason': '基本面有效财务指标不足'}
 
         return {'valid': True, 'reason': ''}
 
