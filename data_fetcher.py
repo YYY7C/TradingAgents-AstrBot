@@ -87,6 +87,55 @@ class DataFetcher:
             )
             stock = self._make_yfinance_ticker(yf, ticker, use_requests_session=True)
             return stock, await self._run_blocking(lambda: stock.info, timeout=timeout)
+
+    @staticmethod
+    def _to_float(value):
+        """将 yfinance/pandas 返回的数值安全转成 float。"""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() in ('', 'N/A'):
+            return None
+        try:
+            if value != value:
+                return None
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _first_numeric_info_value(self, info: dict, *keys: str):
+        for key in keys:
+            value = self._to_float(info.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _income_statement_value(self, income, *row_names: str):
+        if income is None or getattr(income, 'empty', True):
+            return None
+        for row_name in row_names:
+            if row_name not in income.index:
+                continue
+            row = income.loc[row_name]
+            values = row.tolist() if hasattr(row, 'tolist') else [row]
+            for value in values:
+                numeric_value = self._to_float(value)
+                if numeric_value is not None:
+                    return numeric_value
+        return None
+
+    def _calculate_margin(self, numerator, denominator):
+        numerator_value = self._to_float(numerator)
+        denominator_value = self._to_float(denominator)
+        if numerator_value is None or denominator_value in (None, 0):
+            return None
+        return numerator_value / denominator_value
+
+    def _format_ratio_percent(self, value) -> str:
+        numeric_value = self._to_float(value)
+        return f"{numeric_value * 100:.2f}%" if numeric_value is not None else 'N/A'
     
     def _initialize_akshare(self):
         """
@@ -1168,14 +1217,18 @@ class DataFetcher:
                     'trailingPE', 'forwardPE', 'priceToBook',
                     'priceToSalesTrailing12Months', 'marketCap',
                     'trailingEps', 'totalRevenue', 'profitMargins',
+                    'grossProfitMargin', 'grossMargins',
+                    'operatingProfitMargin', 'operatingMargins',
                 ]
                 valid_key_count = sum(
                     1 for field in key_fields
                     if info.get(field) not in (None, '', 'N/A')
                 )
-                
+
                 # 获取财务报表
                 financial_text = ""
+                income = None
+                balance = None
                 try:
                     income = await self._run_blocking(lambda: stock.income_stmt, timeout=30)
                     balance = await self._run_blocking(lambda: stock.balance_sheet, timeout=30)
@@ -1197,9 +1250,38 @@ class DataFetcher:
                                 financial_text += f"- {name}: ${value:,.0f}\n"
                 except Exception as e:
                     logger.warning(f"获取美股财务报表失败: {e}")
-                
+
                 if valid_key_count == 0 and not financial_text:
                     return "无法获取美股基本面数据: yfinance未返回有效财务指标"
+
+                total_revenue = self._first_numeric_info_value(info, 'totalRevenue')
+                if total_revenue is None:
+                    total_revenue = self._income_statement_value(income, 'Total Revenue', 'TotalRevenue')
+
+                gross_margin = self._first_numeric_info_value(
+                    info,
+                    'grossProfitMargin',
+                    'grossMargins',
+                )
+                if gross_margin is None:
+                    gross_profit = self._income_statement_value(income, 'Gross Profit', 'GrossProfit')
+                    gross_margin = self._calculate_margin(gross_profit, total_revenue)
+
+                operating_margin = self._first_numeric_info_value(
+                    info,
+                    'operatingProfitMargin',
+                    'operatingMargins',
+                )
+                if operating_margin is None:
+                    operating_income = self._income_statement_value(
+                        income,
+                        'Operating Income',
+                        'Total Operating Income As Reported',
+                        'OperatingIncome',
+                    )
+                    operating_margin = self._calculate_margin(operating_income, total_revenue)
+
+                profit_margin = self._first_numeric_info_value(info, 'profitMargins')
 
                 result_parts.append(f"""### 估值指标（yfinance）
 | 指标 | 数值 |
@@ -1219,9 +1301,9 @@ class DataFetcher:
 | EPS(前瞻) | ${info.get('forwardEps', 'N/A')} |
 | 净利润 | ${format(info.get('netIncomeToCommon'), ',.0f') if info.get('netIncomeToCommon') else 'N/A'} |
 | 收入 | ${format(info.get('totalRevenue'), ',.0f') if info.get('totalRevenue') else 'N/A'} |
-| 毛利率 | {f"{info.get('grossProfitMargin')*100:.2f}%" if info.get('grossProfitMargin') else 'N/A'} |
-| 营业利润率 | {f"{info.get('operatingProfitMargin')*100:.2f}%" if info.get('operatingProfitMargin') else 'N/A'} |
-| 净利率 | {f"{info.get('profitMargins')*100:.2f}%" if info.get('profitMargins') else 'N/A'} |
+| 毛利率 | {self._format_ratio_percent(gross_margin)} |
+| 营业利润率 | {self._format_ratio_percent(operating_margin)} |
+| 净利率 | {self._format_ratio_percent(profit_margin)} |
 
 ### 财务数据
 {financial_text if financial_text else '暂无详细财务数据'}

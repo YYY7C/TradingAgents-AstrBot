@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 import unittest
@@ -32,6 +33,77 @@ from astrbot_plugin_tradingagents.data_fetcher import DataFetcher
 
 
 class DataValidationTest(unittest.TestCase):
+    def _make_us_fundamentals_fetcher(self, info, income=None, balance=None):
+        fetcher = DataFetcher.__new__(DataFetcher)
+        fetcher._akshare_available = False
+        fetcher._yfinance_available = True
+
+        stock = types.SimpleNamespace(
+            income_stmt=income if income is not None else pd.DataFrame(),
+            balance_sheet=balance if balance is not None else pd.DataFrame(),
+        )
+
+        async def fake_get_yfinance_info(_yf, _ticker, timeout=30):
+            return stock, info
+
+        fetcher._get_yfinance_info = fake_get_yfinance_info
+        return fetcher
+
+    def test_us_fundamentals_uses_yfinance_margin_aliases(self):
+        info = {
+            "shortName": "Marvell Technology, Inc.",
+            "quoteType": "EQUITY",
+            "trailingPE": 84.00342,
+            "forwardPE": 39.7043,
+            "priceToBook": 11.790521,
+            "priceToSalesTrailing12Months": 24.61595,
+            "enterpriseToEbitda": 79.651,
+            "marketCap": 214580000000,
+            "enterpriseValue": 216420000000,
+            "trailingEps": 2.92,
+            "forwardEps": 6.17792,
+            "netIncomeToCommon": 2526700032,
+            "totalRevenue": 8717100032,
+            "grossMargins": 0.51502997,
+            "operatingMargins": 0.14479999,
+            "profitMargins": 0.28986,
+        }
+        fetcher = self._make_us_fundamentals_fetcher(info)
+        fake_yfinance = types.ModuleType("yfinance")
+
+        with patch.dict(sys.modules, {"yfinance": fake_yfinance}):
+            data = asyncio.run(fetcher.get_fundamentals("MRVL", "2026-07-03"))
+
+        self.assertIn("| 毛利率 | 51.50% |", data)
+        self.assertIn("| 营业利润率 | 14.48% |", data)
+        self.assertIn("| 净利率 | 28.99% |", data)
+
+    def test_us_fundamentals_calculates_missing_margins_from_income_statement(self):
+        info = {
+            "shortName": "Marvell Technology, Inc.",
+            "quoteType": "EQUITY",
+            "trailingPE": 84.00342,
+            "totalRevenue": 8194600000,
+            "profitMargins": 0.28986,
+        }
+        income = pd.DataFrame(
+            {
+                pd.Timestamp("2026-01-31"): {
+                    "Total Revenue": 8194600000,
+                    "Gross Profit": 4180700000,
+                    "Operating Income": 1338400000,
+                }
+            }
+        )
+        fetcher = self._make_us_fundamentals_fetcher(info, income=income)
+        fake_yfinance = types.ModuleType("yfinance")
+
+        with patch.dict(sys.modules, {"yfinance": fake_yfinance}):
+            data = asyncio.run(fetcher.get_fundamentals("MRVL", "2026-07-03"))
+
+        self.assertIn("| 毛利率 | 51.02% |", data)
+        self.assertIn("| 营业利润率 | 16.33% |", data)
+
     def test_yfinance_fallback_success_text_is_valid_market_data(self):
         data = """## 美股市场数据
 
