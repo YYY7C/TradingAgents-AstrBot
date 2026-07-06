@@ -29,6 +29,113 @@ class DataFetcher:
     async def _run_akshare(self, func, *args, timeout: int = 30, **kwargs):
         """在线程池中执行 akshare 调用（不修改全局 requests.get）。"""
         return await self._run_blocking(func, *args, timeout=timeout, **kwargs)
+
+    def _format_technical_indicators(self, hist_df, currency_symbol: str) -> str:
+        """格式化通用技术指标；失败时不影响主行情返回。"""
+        try:
+            from .utils.technical_indicators import format_technical_indicators
+
+            return "\n" + format_technical_indicators(hist_df, currency_symbol) + "\n"
+        except Exception as e:
+            logger.warning(f"技术指标计算失败: {e}")
+            return "\n### 技术指标\n计算失败，无法提供真实技术指标\n"
+
+    def _make_yfinance_ticker(self, yf, ticker: str, use_requests_session: bool = False):
+        """创建 yfinance Ticker；默认保留 yfinance 自带传输层，仅在指定时用 requests 兜底。"""
+        if not use_requests_session:
+            return yf.Ticker(ticker)
+
+        try:
+            import requests
+
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            return yf.Ticker(ticker, session=session)
+        except Exception as e:
+            logger.warning(f"创建 yfinance requests Session 失败，使用默认 Ticker: {e}")
+            return yf.Ticker(ticker)
+
+    def _is_yfinance_transport_error(self, error: Exception) -> bool:
+        """识别 yfinance/curl_cffi 在本机环境里的 TLS 传输初始化异常。"""
+        message = str(error)
+        transport_markers = (
+            "curl: (35)",
+            "TLS connect error",
+            "OPENSSL_internal",
+            "invalid library",
+        )
+        return any(marker in message for marker in transport_markers)
+
+    async def _get_yfinance_info(self, yf, ticker: str, timeout: int = 30) -> tuple:
+        """获取 yfinance info；默认使用 curl_cffi，遇到本机 TLS 异常才 requests 重试。"""
+        stock = self._make_yfinance_ticker(yf, ticker)
+        try:
+            return stock, await self._run_blocking(lambda: stock.info, timeout=timeout)
+        except Exception as e:
+            if not self._is_yfinance_transport_error(e):
+                raise
+
+            logger.warning(
+                f"yfinance默认传输层获取 {ticker} 失败，使用 requests Session 重试: {e}"
+            )
+            stock = self._make_yfinance_ticker(yf, ticker, use_requests_session=True)
+            return stock, await self._run_blocking(lambda: stock.info, timeout=timeout)
+
+    @staticmethod
+    def _to_float(value):
+        """将 yfinance/pandas 返回的数值安全转成 float。"""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() in ('', 'N/A'):
+            return None
+        try:
+            if value != value:
+                return None
+        except Exception:
+            pass
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _first_numeric_info_value(self, info: dict, *keys: str):
+        for key in keys:
+            value = self._to_float(info.get(key))
+            if value is not None:
+                return value
+        return None
+
+    def _income_statement_value(self, income, *row_names: str):
+        if income is None or getattr(income, 'empty', True):
+            return None
+        for row_name in row_names:
+            if row_name not in income.index:
+                continue
+            row = income.loc[row_name]
+            values = row.tolist() if hasattr(row, 'tolist') else [row]
+            for value in values:
+                numeric_value = self._to_float(value)
+                if numeric_value is not None:
+                    return numeric_value
+        return None
+
+    def _calculate_margin(self, numerator, denominator):
+        numerator_value = self._to_float(numerator)
+        denominator_value = self._to_float(denominator)
+        if numerator_value is None or denominator_value in (None, 0):
+            return None
+        return numerator_value / denominator_value
+
+    def _format_ratio_percent(self, value) -> str:
+        numeric_value = self._to_float(value)
+        return f"{numeric_value * 100:.2f}%" if numeric_value is not None else 'N/A'
     
     def _initialize_akshare(self):
         """
@@ -73,7 +180,7 @@ class DataFetcher:
             return 'sh'
         return 'sz'
 
-    def _tencent_kline(self, code: str, days: int = 60) -> "pd.DataFrame":
+    def _tencent_kline(self, code: str, days: int = 90) -> "pd.DataFrame":
         """通过腾讯接口获取 A 股前复权日 K 线，返回 DataFrame。
         
         列: 日期, 开盘, 收盘, 最高, 最低, 成交量
@@ -95,7 +202,11 @@ class DataFetcher:
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows, columns=['日期', '开盘', '收盘', '最高', '最低', '成交量'])
+        normalized_rows = [row[:6] for row in rows if len(row) >= 6]
+        if not normalized_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(normalized_rows, columns=['日期', '开盘', '收盘', '最高', '最低', '成交量'])
         for col in ('开盘', '收盘', '最高', '最低'):
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce')
@@ -243,7 +354,7 @@ class DataFetcher:
             code = StockUtils.strip_market_prefix(ticker)
             
             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-            start_date = end_date - timedelta(days=30)
+            start_date = end_date - timedelta(days=90)
             
             # 重试机制 - 最多尝试3次（akshare / 东方财富）
             df = None
@@ -280,7 +391,7 @@ class DataFetcher:
             if df is None or df.empty:
                 logger.info(f"东方财富接口不可用，尝试腾讯接口获取A股数据: {code}")
                 try:
-                    df = await self._run_blocking(self._tencent_kline, code, 30)
+                    df = await self._run_blocking(self._tencent_kline, code, 90)
                     if df is not None and not df.empty:
                         use_tencent = True
                         # 添加「涨跌幅」列（腾讯 K 线不含此列）
@@ -345,6 +456,8 @@ class DataFetcher:
                 _pct = row['涨跌幅']
                 _pct_str = f"{_pct:+.2f}" if isinstance(_pct, (int, float)) else str(_pct)
                 result += f"- **{row['日期']}**: 收{row['收盘']} ({_pct_str}%)\n"
+
+            result += self._format_technical_indicators(df, market_info['currency_symbol'])
             
             # 获取实时行情
             if use_tencent:
@@ -489,7 +602,7 @@ class DataFetcher:
             hist_text = ""
             try:
                 end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-                start_date = end_date - timedelta(days=60)  # 多取一些确保有足够交易日
+                start_date = end_date - timedelta(days=90)  # 覆盖 MA60 等常用技术指标
                 
                 hist_df = await self._run_akshare(
                     ak.stock_hk_hist,
@@ -519,6 +632,7 @@ class DataFetcher:
 |------|------|------|------|------|--------|--------|--------|
 | {latest.get('日期', 'N/A')} | {latest.get('开盘', 'N/A')} | {latest.get('收盘', 'N/A')} | {latest.get('最高', 'N/A')} | {latest.get('最低', 'N/A')} | {latest.get('成交量', 'N/A')} | {latest.get('成交额', 'N/A')} | {latest.get('涨跌幅', 'N/A')}% |
 """
+                    hist_text += self._format_technical_indicators(hist_df, market_info['currency_symbol'])
                 else:
                     hist_text = "### 历史K线\n暂无历史K线数据\n"
             except Exception as e:
@@ -547,8 +661,89 @@ class DataFetcher:
             return f"获取港股数据失败: {str(e)}"
     
 
+    def _format_us_sina_market_data(self, ticker: str, trade_date: str, market_info: Dict, hist_df) -> str:
+        """格式化 akshare 新浪财经美股日线数据。"""
+        import pandas as pd
+
+        if hist_df is None or hist_df.empty:
+            return "新浪财经美股日线数据为空"
+
+        df = hist_df.copy()
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df = df.dropna(subset=['date']).sort_values('date')
+            end_date = pd.to_datetime(trade_date, errors='coerce')
+            if pd.notna(end_date):
+                df = df[df['date'] <= end_date]
+        else:
+            df = df.sort_index()
+            end_date = pd.to_datetime(trade_date, errors='coerce')
+            if pd.notna(end_date):
+                df = df[df.index <= end_date]
+
+        if df.empty:
+            return "新浪财经美股日线数据为空"
+
+        latest = df.iloc[-1]
+
+        def _fmt_money(value):
+            try:
+                return f"${float(value):.2f}"
+            except Exception:
+                return str(value) if value is not None else "N/A"
+
+        def _fmt_number(value):
+            try:
+                return f"{float(value):,.0f}"
+            except Exception:
+                return str(value) if value is not None else "N/A"
+
+        def _row_date(row):
+            if 'date' in row.index:
+                value = row.get('date')
+                if hasattr(value, 'strftime'):
+                    return value.strftime('%Y-%m-%d')
+                return str(value)
+            idx = row.name
+            return idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
+
+        latest_date = _row_date(latest)
+        latest_close = latest.get('close', 'N/A')
+
+        hist_text = "### 最近5个交易日\n"
+        close_pct = df['close'].pct_change() * 100 if 'close' in df.columns else None
+        for idx, row in df.tail(5).iterrows():
+            pct = close_pct.loc[idx] if close_pct is not None and idx in close_pct.index else 0
+            pct = 0 if pct != pct else pct
+            pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
+            hist_text += f"- **{_row_date(row)}**: 收{_fmt_money(row.get('close', 'N/A'))} ({pct_str}%)\n"
+        technical_text = self._format_technical_indicators(df, market_info['currency_symbol'])
+
+        return f"""## 美股市场数据
+
+**股票代码**: {ticker}
+**交易日期**: {trade_date}
+**市场**: {market_info['market_name']}
+**货币**: {market_info['currency_name']}（{market_info['currency_symbol']}）
+
+### 日线行情（akshare 新浪财经）
+| 指标 | 数值 |
+|------|------|
+| 最新交易日 | {latest_date} |
+| 开盘 | {_fmt_money(latest.get('open', 'N/A'))} |
+| 最高 | {_fmt_money(latest.get('high', 'N/A'))} |
+| 最低 | {_fmt_money(latest.get('low', 'N/A'))} |
+| 收盘 | {_fmt_money(latest_close)} |
+| 成交量 | {_fmt_number(latest.get('volume', 'N/A'))} |
+
+{hist_text}
+{technical_text}
+---
+*数据来源: akshare（新浪财经 stock_us_daily）*
+"""
+
     async def _get_us_market_data(self, ticker: str, trade_date: str, market_info: Dict) -> str:
-        """获取美股市场数据（akshare主数据源 + yfinance备选）"""
+        """获取美股市场数据（akshare主数据源 + 新浪日线兜底 + yfinance备选）"""
         
         # === 1. 尝试 akshare 作为主数据源 ===
         if self.akshare_available:
@@ -566,18 +761,25 @@ class DataFetcher:
                     if not matched.empty:
                         row = matched.iloc[0]
                         ak_code = row['代码']  # 完整的 akshare 代码
+
+                        def _row_first(*names):
+                            for name in names:
+                                value = row.get(name, None)
+                                if value is not None:
+                                    return value
+                            return 'N/A'
                         
                         realtime_text = f"""### 实时行情（akshare）
 | 指标 | 数值 |
 |------|------|
 | 股票名称 | {row.get('名称', 'N/A')} |
-| 最新价 | ${row.get('最新价', row.get('现价', 'N/A'))} |
+| 最新价 | ${_row_first('最新价', '现价')} |
 | 涨跌额 | {row.get('涨跌额', 'N/A')} |
 | 涨跌幅 | {row.get('涨跌幅', 'N/A')}% |
-| 今开 | {row.get('今开', 'N/A')} |
-| 最高 | {row.get('最高', 'N/A')} |
-| 最低 | {row.get('最低', 'N/A')} |
-| 昨收 | {row.get('昨收', 'N/A')} |
+| 今开 | {_row_first('今开', '开盘价')} |
+| 最高 | {_row_first('最高', '最高价')} |
+| 最低 | {_row_first('最低', '最低价')} |
+| 昨收 | {_row_first('昨收', '昨收价')} |
 | 成交量 | {row.get('成交量', 'N/A')} |
 | 成交额 | {row.get('成交额', 'N/A')} |
 | 总市值 | {row.get('总市值', 'N/A')} |
@@ -587,7 +789,7 @@ class DataFetcher:
                         hist_text = ""
                         try:
                             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-                            start_date = end_date - timedelta(days=60)
+                            start_date = end_date - timedelta(days=90)
                             
                             hist_df = await self._run_akshare(
                                 ak.stock_us_hist,
@@ -607,6 +809,7 @@ class DataFetcher:
                                     pct = hrow.get('涨跌幅', 'N/A')
                                     _pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
                                     hist_text += f"- **{date_str}**: 收${close} ({_pct_str}%)\n"
+                                hist_text += self._format_technical_indicators(hist_df, market_info['currency_symbol'])
                         except Exception as e:
                             logger.warning(f"获取美股历史K线失败(akshare): {e}")
                             hist_text = "\n### 历史K线\n获取失败\n"
@@ -624,7 +827,20 @@ class DataFetcher:
 *数据来源: akshare（东方财富）*
 """
             except Exception as e:
-                logger.warning(f"akshare获取美股数据失败，回退到yfinance: {e}")
+                logger.warning(f"akshare东方财富获取美股数据失败，尝试新浪财经日线接口: {e}")
+
+            try:
+                import akshare as ak
+
+                hist_df = await self._run_akshare(
+                    ak.stock_us_daily,
+                    symbol=ticker,
+                    adjust="qfq",
+                    timeout=30,
+                )
+                return self._format_us_sina_market_data(ticker, trade_date, market_info, hist_df)
+            except Exception as e:
+                logger.warning(f"akshare新浪获取美股日线失败，回退到yfinance: {e}")
         
         # === 2. 回退到 yfinance ===
         if not self.yfinance_available:
@@ -633,12 +849,11 @@ class DataFetcher:
         try:
             import yfinance as yf
             
-            stock = yf.Ticker(ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
             
             # 获取历史数据
             end_date = datetime.strptime(trade_date, '%Y-%m-%d')
-            start_date = end_date - timedelta(days=30)
+            start_date = end_date - timedelta(days=90)
             hist = await self._run_blocking(stock.history, start=start_date, end=end_date, timeout=30)
             
             hist_text = ""
@@ -653,6 +868,7 @@ class DataFetcher:
                     pct = 0 if (pct != pct) else pct  # NaN guard
                     _pct_str = f"{pct:+.2f}" if isinstance(pct, (int, float)) else str(pct)
                     hist_text += f"- **{date_str}**: 收${close:.2f} ({_pct_str}%)\n"
+                hist_text += self._format_technical_indicators(hist, market_info['currency_symbol'])
             
             return f"""## 美股市场数据
 
@@ -737,6 +953,7 @@ class DataFetcher:
 
 """
                 
+                valid_indicator_count = 0
                 if main_indicators is not None and not main_indicators.empty:
                     # 找到最新一期数据的列
                     cols = main_indicators.columns.tolist()
@@ -772,6 +989,7 @@ class DataFetcher:
                             if not row.empty:
                                 val = row[latest_col].values[0]
                                 if pd.notna(val):
+                                    valid_indicator_count += 1
                                     if isinstance(val, (int, float)):
                                         if abs(val) > 1e8:  # 亿
                                             result += f"| {display_name} | {val/1e8:.2f}亿 |\n"
@@ -785,7 +1003,10 @@ class DataFetcher:
                                     result += f"| {display_name} | N/A |\n"
                             else:
                                 result += f"| {display_name} | N/A |\n"
-                
+
+                if valid_indicator_count == 0:
+                    return "无法获取A股基本面数据: 财务指标为空"
+                 
                 return result
                 
             except Exception as e:
@@ -857,8 +1078,7 @@ class DataFetcher:
                 import yfinance as yf
                 
                 yf_ticker = f"{code}.HK"
-                stock = yf.Ticker(yf_ticker)
-                info = await self._run_blocking(lambda: stock.info, timeout=30)
+                stock, info = await self._get_yfinance_info(yf, yf_ticker, timeout=30)
                 
                 if info:
                     # 估值指标
@@ -968,11 +1188,47 @@ class DataFetcher:
             try:
                 import yfinance as yf
                 
-                stock = yf.Ticker(ticker)
-                info = await self._run_blocking(lambda: stock.info, timeout=30)
-                
+                stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
+                if not isinstance(info, dict):
+                    info = {}
+
+                quote_type = str(info.get('quoteType') or '').upper()
+                legal_type = str(info.get('legalType') or '').lower()
+                is_fund = quote_type in ('ETF', 'MUTUALFUND') or 'fund' in legal_type
+                if is_fund:
+                    result_parts.append(f"""### 基金基本信息（yfinance）
+| 指标 | 数值 |
+|------|------|
+| 基金名称 | {info.get('longName') or info.get('shortName') or 'N/A'} |
+| 基金类型 | {info.get('quoteType', 'N/A')} |
+| 基金分类 | {info.get('category', 'N/A')} |
+| 基金公司 | {info.get('fundFamily', 'N/A')} |
+| 法律类型 | {info.get('legalType', 'N/A')} |
+| 基金规模/总资产 | ${format(info.get('totalAssets'), ',.0f') if info.get('totalAssets') else 'N/A'} |
+| 净值 | ${info.get('navPrice', 'N/A')} |
+| 市盈率(TTM) | {info.get('trailingPE', 'N/A')} |
+| 费用率 | {f"{info.get('expenseRatio')*100:.2f}%" if info.get('expenseRatio') else 'N/A'} |
+| 收益率 | {f"{info.get('yield')*100:.2f}%" if info.get('yield') else 'N/A'} |
+""")
+                    result_parts.append("\n*数据来源: yfinance + akshare（雪球）*\n")
+                    return "\n".join(result_parts)
+
+                key_fields = [
+                    'trailingPE', 'forwardPE', 'priceToBook',
+                    'priceToSalesTrailing12Months', 'marketCap',
+                    'trailingEps', 'totalRevenue', 'profitMargins',
+                    'grossProfitMargin', 'grossMargins',
+                    'operatingProfitMargin', 'operatingMargins',
+                ]
+                valid_key_count = sum(
+                    1 for field in key_fields
+                    if info.get(field) not in (None, '', 'N/A')
+                )
+
                 # 获取财务报表
                 financial_text = ""
+                income = None
+                balance = None
                 try:
                     income = await self._run_blocking(lambda: stock.income_stmt, timeout=30)
                     balance = await self._run_blocking(lambda: stock.balance_sheet, timeout=30)
@@ -994,7 +1250,39 @@ class DataFetcher:
                                 financial_text += f"- {name}: ${value:,.0f}\n"
                 except Exception as e:
                     logger.warning(f"获取美股财务报表失败: {e}")
-                
+
+                if valid_key_count == 0 and not financial_text:
+                    return "无法获取美股基本面数据: yfinance未返回有效财务指标"
+
+                total_revenue = self._first_numeric_info_value(info, 'totalRevenue')
+                if total_revenue is None:
+                    total_revenue = self._income_statement_value(income, 'Total Revenue', 'TotalRevenue')
+
+                gross_margin = self._first_numeric_info_value(
+                    info,
+                    'grossProfitMargin',
+                    'grossMargins',
+                )
+                if gross_margin is None:
+                    gross_profit = self._income_statement_value(income, 'Gross Profit', 'GrossProfit')
+                    gross_margin = self._calculate_margin(gross_profit, total_revenue)
+
+                operating_margin = self._first_numeric_info_value(
+                    info,
+                    'operatingProfitMargin',
+                    'operatingMargins',
+                )
+                if operating_margin is None:
+                    operating_income = self._income_statement_value(
+                        income,
+                        'Operating Income',
+                        'Total Operating Income As Reported',
+                        'OperatingIncome',
+                    )
+                    operating_margin = self._calculate_margin(operating_income, total_revenue)
+
+                profit_margin = self._first_numeric_info_value(info, 'profitMargins')
+
                 result_parts.append(f"""### 估值指标（yfinance）
 | 指标 | 数值 |
 |------|------|
@@ -1013,9 +1301,9 @@ class DataFetcher:
 | EPS(前瞻) | ${info.get('forwardEps', 'N/A')} |
 | 净利润 | ${format(info.get('netIncomeToCommon'), ',.0f') if info.get('netIncomeToCommon') else 'N/A'} |
 | 收入 | ${format(info.get('totalRevenue'), ',.0f') if info.get('totalRevenue') else 'N/A'} |
-| 毛利率 | {f"{info.get('grossProfitMargin')*100:.2f}%" if info.get('grossProfitMargin') else 'N/A'} |
-| 营业利润率 | {f"{info.get('operatingProfitMargin')*100:.2f}%" if info.get('operatingProfitMargin') else 'N/A'} |
-| 净利率 | {f"{info.get('profitMargins')*100:.2f}%" if info.get('profitMargins') else 'N/A'} |
+| 毛利率 | {self._format_ratio_percent(gross_margin)} |
+| 营业利润率 | {self._format_ratio_percent(operating_margin)} |
+| 净利率 | {self._format_ratio_percent(profit_margin)} |
 
 ### 财务数据
 {financial_text if financial_text else '暂无详细财务数据'}
@@ -1087,6 +1375,51 @@ class DataFetcher:
             return "akshare未安装"
         except Exception as e:
             return f"获取A股新闻失败: {str(e)}"
+
+    def _format_yfinance_news_item(self, item: Dict) -> str:
+        """格式化 yfinance 新闻条目，兼容新旧返回结构。"""
+        content = item.get('content') if isinstance(item.get('content'), dict) else item
+        title = content.get('title') or item.get('title')
+        if not title or title == 'N/A':
+            return ""
+
+        provider = content.get('provider') if isinstance(content.get('provider'), dict) else {}
+        publisher = (
+            content.get('publisher')
+            or item.get('publisher')
+            or provider.get('displayName')
+            or provider.get('sourceId')
+            or 'N/A'
+        )
+
+        pub_ts = (
+            content.get('providerPublishTime')
+            or item.get('providerPublishTime')
+            or content.get('pubDate')
+            or item.get('pubDate')
+            or content.get('displayTime')
+            or ''
+        )
+        if isinstance(pub_ts, (int, float)) and pub_ts:
+            try:
+                from datetime import timezone
+                pub_date = datetime.fromtimestamp(int(pub_ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                pub_date = str(pub_ts)
+        else:
+            pub_date = str(pub_ts) if pub_ts else 'N/A'
+
+        url = ''
+        for key in ('clickThroughUrl', 'canonicalUrl'):
+            value = content.get(key)
+            if isinstance(value, dict) and value.get('url'):
+                url = value.get('url')
+                break
+        if not url:
+            url = content.get('link') or item.get('link') or ''
+
+        suffix = f" - {url}" if url else ""
+        return f"- **{publisher}** ({pub_date}): {title}{suffix}\n"
     
     async def _get_hk_news(self, ticker: str, trade_date: str, market_info: Dict) -> str:
         """获取港股新闻（yfinance）"""
@@ -1111,20 +1444,10 @@ class DataFetcher:
 ### 近期新闻
 """
                 for item in news[:10]:
-                    title = item.get('title', 'N/A')
-                    publisher = item.get('publisher', 'N/A')
-                    # yfinance 新闻时间戳处理
-                    pub_ts = item.get('providerPublishTime', item.get('pubDate', ''))
-                    if isinstance(pub_ts, (int, float)) and pub_ts:
-                        try:
-                            from datetime import timezone
-                            pub_date = datetime.fromtimestamp(int(pub_ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
-                        except Exception:
-                            pub_date = str(pub_ts)
-                    else:
-                        pub_date = str(pub_ts)
-                    news_text += f"- **{publisher}** ({pub_date}): {title}\n"
+                    news_text += self._format_yfinance_news_item(item)
                 
+                if "): " not in news_text:
+                    return f"暂无港股{code}.HK的有效新闻数据"
                 news_text += "\n---\n*数据来源: yfinance*\n"
                 return news_text
             else:
@@ -1149,11 +1472,10 @@ class DataFetcher:
                 news_text = f"## 美股新闻数据\n\n**股票代码**: {ticker}\n**日期**: {trade_date}\n\n### 近期新闻\n"
                 
                 for item in news[:10]:
-                    pub_date = item.get('pubDate', 'N/A')
-                    title = item.get('title', 'N/A')
-                    publisher = item.get('publisher', 'N/A')
-                    news_text += f"- **{publisher}** ({pub_date}): {title}\n"
+                    news_text += self._format_yfinance_news_item(item)
                 
+                if "): " not in news_text:
+                    return f"暂无{ticker}的有效新闻数据"
                 return news_text
             else:
                 return f"暂无{ticker}的新闻数据"
@@ -1244,8 +1566,7 @@ class DataFetcher:
             import yfinance as yf
             
             yf_ticker = f"{code}.HK"
-            stock = yf.Ticker(yf_ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, yf_ticker, timeout=30)
             
             sentiment_parts = [f"""## 港股情绪数据
 
@@ -1305,8 +1626,7 @@ class DataFetcher:
         try:
             import yfinance as yf
             
-            stock = yf.Ticker(ticker)
-            info = await self._run_blocking(lambda: stock.info, timeout=30)
+            stock, info = await self._get_yfinance_info(yf, ticker, timeout=30)
             
             # 从分析评级获取情绪
             recommendations = await self._run_blocking(
@@ -1918,7 +2238,7 @@ class DataFetcher:
 
         # 通用失败关键词（对所有长度都检测）
         failure_keywords = [
-            '获取失败', '未安装', '无法获取', '不可用',
+            '获取失败', '未安装', '无法获取',
             'akshare和yfinance均不可用',
             '需要付费数据源',
             '数据失败',     # 匹配 "获取市场数据失败"、"获取基本面数据失败" 等
@@ -1931,6 +2251,13 @@ class DataFetcher:
             if kw in data_stripped:
                 return {'valid': False, 'reason': data_first_line}
 
+        first_line_failure_keywords = [
+            '不可用',
+        ]
+        for kw in first_line_failure_keywords:
+            if kw in data_first_line:
+                return {'valid': False, 'reason': data_first_line}
+
         # 长文本失败模式检测：Markdown 格式的错误页面
         long_failure_patterns = [
             r'暂无.+的行情数据',  # 港股无数据时的返回（如 "暂无港股0700的行情数据"）
@@ -1939,6 +2266,33 @@ class DataFetcher:
         for pattern in long_failure_patterns:
             if re.search(pattern, data_stripped):
                 return {'valid': False, 'reason': data_first_line}
+
+        if source_name == '基本面数据':
+            metric_keywords = [
+                '市盈率', '市净率', '市销率', 'ROE', '净资产收益率',
+                '每股收益', 'EPS', '净利润', '收入', '营业总收入',
+                '毛利率', '净利率', '市值', '企业价值', '资产负债率',
+                '经营现金流', '流动比率', '速动比率',
+                '基金规模', '总资产', '净值', '费用率', '收益率',
+                '基金类型', '基金分类', '基金公司',
+            ]
+            invalid_values = ('N/A', '暂无', '未知', '无法获取', '获取失败', '未安装')
+            valid_metric_count = 0
+            for line in data_stripped.splitlines():
+                line_stripped = line.strip()
+                if not line_stripped.startswith('|') or line_stripped.startswith('|------'):
+                    continue
+                if not any(keyword in line_stripped for keyword in metric_keywords):
+                    continue
+                cells = [cell.strip() for cell in line_stripped.strip('|').split('|')]
+                if len(cells) < 2:
+                    continue
+                value = cells[-1]
+                if value and not any(marker in value for marker in invalid_values):
+                    valid_metric_count += 1
+
+            if valid_metric_count < 2:
+                return {'valid': False, 'reason': '基本面有效财务指标不足'}
 
         return {'valid': True, 'reason': ''}
 

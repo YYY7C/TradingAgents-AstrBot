@@ -365,11 +365,17 @@ def markdown_to_pdf_bytes(md_text: str) -> bytes:
     # 预处理：规范化标题层级，避免 LLM 误用 ## 导致层级扁平
     md_for_pdf = _normalize_heading_levels(md_for_pdf)
 
-    # Markdown → HTML
-    body_html = markdown.markdown(
-        md_for_pdf,
-        extensions=["tables", "fenced_code"],
-    )
+    # Markdown → HTML。部分 AstrBot 运行环境会同时暴露多份 markdown 包，
+    # 导致扩展类型校验失败；失败时退回基础 Markdown 渲染，保证 PDF 可生成。
+    try:
+        body_html = markdown.markdown(
+            md_for_pdf,
+            extensions=["tables", "fenced_code"],
+        )
+    except TypeError as e:
+        if "markdown.extensions.Extension" not in str(e):
+            raise
+        body_html = markdown.markdown(md_for_pdf)
 
     full_html = _build_report_html(
         body_html=body_html,
@@ -415,9 +421,15 @@ def save_report_pdf(md_text: str, ticker: str, output_dir: str | None = None) ->
     filepath = os.path.join(output_dir, filename)
 
     pdf_bytes = markdown_to_pdf_bytes(md_text)
+    if not pdf_bytes:
+        raise RuntimeError("PDF 生成结果为空")
 
     with open(filepath, "wb") as f:
         f.write(pdf_bytes)
+
+    file_size = os.path.getsize(filepath)
+    if file_size <= 0:
+        raise RuntimeError(f"PDF 文件写入后为空: {filepath}")
 
     return filepath
 
